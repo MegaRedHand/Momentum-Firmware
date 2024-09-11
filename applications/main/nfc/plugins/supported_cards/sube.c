@@ -13,7 +13,98 @@
 const uint64_t SECTOR_0_BLOCK_3_KEY_A = 0x7B296F353C6B;
 const uint64_t SECTOR_3_BLOCK_15_KEY_A = 0x3FA7217EC575;
 
+typedef struct {
+    int32_t balance_pesos;
+    uint8_t balance_cents;
+    const uint8_t* card_number;
+} SubeData;
+
+// Parses MFC card data into a SubeData struct.
+// WARNING: sube_data might reference some of the data in mf_data, so it should not be used after mf_data is freed.
+static bool parse_sube_data(const MfClassicData* mf_data, SubeData* sube_data) {
+    const uint8_t balance_block_number = 16;
+    if(!mf_classic_is_block_read(mf_data, balance_block_number)) {
+        return false;
+    }
+    // PARSE BALANCE
+    const uint8_t* balance_block = &mf_data->block[balance_block_number].data[0];
+    // The first 20 bits of the block seem to be a magic number
+    if(balance_block[0] != 0x11 || balance_block[1] != 0x5A || (balance_block[2] & 0xF) != 2) {
+        return false;
+    }
+    // Balance is stored in 4 bytes (minus 4 bits), starting with the 3rd byte of the block
+    const int64_t balance_shifted = bit_lib_bytes_to_num_le(&balance_block[2], 4);
+    // The first 4 bits of the first byte are fixed, and the balance is shifted by 485,76 pesos
+    // allowing the card to have a negative balance
+    const int32_t balance = (balance_shifted - 777218) >> 4;
+
+    sube_data->balance_pesos = balance / 100;
+    sube_data->balance_cents = balance % 100;
+
+    // PARSE CARD NUMBER
+    const char magic_number[7] = "SUBE P1";
+    // Block 9 contains the ASCII string for "SUBE"
+    // Block 10 contains the ASCII string for "SUBE P1"
+    bool is_legacy = strncmp((const char*)&mf_data->block[9].data[0], magic_number, 4) == 0 &&
+                     strncmp((const char*)&mf_data->block[10].data[0], magic_number, 7) == 0;
+
+    sube_data->card_number = NULL;
+    // Old cards have the card number encoded in the card
+    if(is_legacy) {
+        sube_data->card_number = &mf_data->block[8].data[0];
+    }
+    return true;
+}
+
+static bool card_number_is_valid(const char* hex_str, int len) {
+    // TODO: validate the checksum
+    for(int i = 0; i < len; i++) {
+        if(hex_str[i] == ' ') continue;
+        if(hex_str[i] < '0' || hex_str[i] > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool render_sube_data(const SubeData* sube, FuriString* parsed_data) {
+    FURI_LOG_D(TAG, "Rendering SUBE card data");
+    furi_string_printf(parsed_data, "\e#SUBE\n");
+
+    // Maybe render card number
+    const uint8_t* card_number = sube->card_number;
+    if(card_number) {
+        char card_number_str[16 + 3 + 1] = {};
+        snprintf(
+            card_number_str,
+            sizeof(card_number_str),
+            "%02x%02x %02x%02x %02x%02x %02x%02x",
+            card_number[0],
+            card_number[1],
+            card_number[2],
+            card_number[3],
+            card_number[4],
+            card_number[5],
+            card_number[6],
+            card_number[7]);
+
+        if(!card_number_is_valid(card_number_str, sizeof(card_number_str) - 1)) {
+            return false;
+        }
+        FURI_LOG_D(TAG, "Rendering card number");
+        furi_string_cat_printf(parsed_data, "Card Number:\n%s\n", card_number_str);
+    }
+
+    // Render card balance
+    FURI_LOG_D(TAG, "Rendering card balance");
+    // Fallback to showing the balance only
+    furi_string_cat_printf(
+        parsed_data, "Balance: %li.%02i pesos", sube->balance_pesos, sube->balance_cents);
+    return true;
+}
+
 static bool sube_verify(Nfc* nfc) {
+    furi_assert(nfc);
     bool verified = false;
 
     do {
@@ -85,16 +176,6 @@ static bool sube_read(Nfc* nfc, NfcDevice* device) {
     return is_read;
 }
 
-static bool hex_is_valid(const char* hex_str, int len) {
-    for(int i = 0; i < len; i++) {
-        if(hex_str[i] == ' ') continue;
-        if(hex_str[i] < '0' || hex_str[i] > '9') {
-            return false;
-        }
-    }
-    return true;
-}
-
 static bool sube_parse(const NfcDevice* device, FuriString* parsed_data) {
     furi_assert(device);
 
@@ -113,63 +194,12 @@ static bool sube_parse(const NfcDevice* device, FuriString* parsed_data) {
 
         // Parse balance data
         FURI_LOG_D(TAG, "Parsing balance data");
-        const uint8_t balance_block_number = 16;
-        const uint8_t* balance_start_ptr = &data->block[balance_block_number].data[2];
-
-        // Balance is stored in 4 bytes, starting with the 3rd byte of the block
-        const int64_t balance_shifted = bit_lib_bytes_to_num_le(balance_start_ptr, 4);
-        // The first 4 bits of the first byte are not used, and the balance is shifted by 485,76 pesos
-        // allowing the card to have a negative balance
-        const int32_t balance = (balance_shifted - 777218) >> 4;
-
-        int32_t balance_pesos = balance / 100;
-        int8_t balance_cents = balance % 100;
-
-        // Parse magic number
-        FURI_LOG_D(TAG, "Parsing magic number");
-        const char magic_number[7] = "SUBE P1";
-        // Block 9 contains the ASCII string for "SUBE"
-        // Block 10 contains the ASCII string for "SUBE P1"
-        bool is_legacy = strncmp((const char*)&data->block[9].data[0], magic_number, 4) == 0 &&
-                         strncmp((const char*)&data->block[10].data[0], magic_number, 7) == 0;
-
-        // Old cards have the card number encoded in the card
-        if(is_legacy) {
-            FURI_LOG_D(TAG, "Detected legacy card");
-            const uint8_t* card_number = &data->block[8].data[0];
-            char card_number_str[16 + 3 + 1] = {};
-            snprintf(
-                card_number_str,
-                sizeof(card_number_str),
-                "%02x%02x %02x%02x %02x%02x %02x%02x",
-                card_number[0],
-                card_number[1],
-                card_number[2],
-                card_number[3],
-                card_number[4],
-                card_number[5],
-                card_number[6],
-                card_number[7]);
-
-            // TODO: validate the checksum
-            if(hex_is_valid(card_number_str, sizeof(card_number_str) - 1)) {
-                FURI_LOG_D(TAG, "Card number is valid");
-                furi_string_printf(
-                    parsed_data,
-                    "\e#SUBE\nNumber: %s\nBalance: %li.%02i pesos",
-                    card_number_str,
-                    balance_pesos,
-                    balance_cents);
-                parsed = true;
-                break;
-            }
+        SubeData sube = {0};
+        if(!parse_sube_data(data, &sube)) {
+            break;
         }
 
-        FURI_LOG_D(TAG, "Showing balance only");
-        // Fallback to showing the balance only
-        furi_string_printf(
-            parsed_data, "\e#SUBE\nBalance: %li.%02i pesos", balance_pesos, balance_cents);
-        parsed = true;
+        parsed = render_sube_data(&sube, parsed_data);
     } while(false);
 
     return parsed;
