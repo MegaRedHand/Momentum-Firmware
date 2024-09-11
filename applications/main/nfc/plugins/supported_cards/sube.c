@@ -14,32 +14,51 @@ const uint64_t SECTOR_0_BLOCK_3_KEY_A = 0x7B296F353C6B;
 const uint64_t SECTOR_3_BLOCK_15_KEY_A = 0x3FA7217EC575;
 
 typedef struct {
-    int32_t balance_pesos;
-    uint8_t balance_cents;
+    int32_t pesos;
+    uint8_t cents;
+} Balance;
+
+typedef struct {
+    Balance current_balance;
+    Balance previous_balance;
     const uint8_t* card_number;
 } SubeData;
+
+static bool parse_balance(const uint8_t* block, Balance* balance) {
+    if(block[0] != 0x11 || block[1] != 0x5A || (block[2] & 0xF) != 2) {
+        return false;
+    }
+    // Balance is stored in 4 bytes (minus 4 bits), starting with the 3rd byte of the block
+    const int64_t total_shifted = bit_lib_bytes_to_num_le(&block[2], 4);
+    // The first 4 bits of the first byte are fixed, and the balance is shifted by 485,76 pesos
+    // allowing the card to have a negative balance
+    const int32_t total = (total_shifted - 777218) >> 4;
+
+    balance->pesos = total / 100;
+    balance->cents = total % 100;
+    return true;
+}
 
 // Parses MFC card data into a SubeData struct.
 // WARNING: sube_data might reference some of the data in mf_data, so it should not be used after mf_data is freed.
 static bool parse_sube_data(const MfClassicData* mf_data, SubeData* sube_data) {
-    const uint8_t balance_block_number = 16;
-    if(!mf_classic_is_block_read(mf_data, balance_block_number)) {
+    // PARSE CURRENT BALANCE
+    const uint8_t cb_block_number = 16;
+    if(!mf_classic_is_block_read(mf_data, cb_block_number)) {
         return false;
     }
-    // PARSE BALANCE
-    const uint8_t* balance_block = &mf_data->block[balance_block_number].data[0];
-    // The first 20 bits of the block seem to be a magic number
-    if(balance_block[0] != 0x11 || balance_block[1] != 0x5A || (balance_block[2] & 0xF) != 2) {
+    if(!parse_balance(&mf_data->block[cb_block_number].data[0], &sube_data->current_balance)) {
         return false;
     }
-    // Balance is stored in 4 bytes (minus 4 bits), starting with the 3rd byte of the block
-    const int64_t balance_shifted = bit_lib_bytes_to_num_le(&balance_block[2], 4);
-    // The first 4 bits of the first byte are fixed, and the balance is shifted by 485,76 pesos
-    // allowing the card to have a negative balance
-    const int32_t balance = (balance_shifted - 777218) >> 4;
 
-    sube_data->balance_pesos = balance / 100;
-    sube_data->balance_cents = balance % 100;
+    // PARSE PREVIOUS BALANCE
+    const uint8_t pb_block_number = 17;
+    if(!mf_classic_is_block_read(mf_data, pb_block_number)) {
+        return false;
+    }
+    if(!parse_balance(&mf_data->block[pb_block_number].data[0], &sube_data->previous_balance)) {
+        return false;
+    }
 
     // PARSE CARD NUMBER
     const char magic_number[7] = "SUBE P1";
@@ -99,7 +118,19 @@ static bool render_sube_data(const SubeData* sube, FuriString* parsed_data) {
     FURI_LOG_D(TAG, "Rendering card balance");
     // Fallback to showing the balance only
     furi_string_cat_printf(
-        parsed_data, "Balance: %li.%02i pesos", sube->balance_pesos, sube->balance_cents);
+        parsed_data,
+        "Balance: %li.%02i pesos\n",
+        sube->current_balance.pesos,
+        sube->current_balance.cents);
+
+    if(sube->current_balance.pesos != sube->previous_balance.pesos ||
+       sube->current_balance.cents != sube->previous_balance.cents) {
+        furi_string_cat_printf(
+            parsed_data,
+            "Previous balance: %li.%02i pesos\n",
+            sube->previous_balance.pesos,
+            sube->previous_balance.cents);
+    }
     return true;
 }
 
