@@ -119,7 +119,7 @@ static bool render_sube_data(const SubeData* sube, FuriString* parsed_data) {
     // Fallback to showing the balance only
     furi_string_cat_printf(
         parsed_data,
-        "Balance: %li.%02i pesos\n",
+        "Balance: %li.%02i\n",
         sube->current_balance.pesos,
         sube->current_balance.cents);
 
@@ -127,7 +127,7 @@ static bool render_sube_data(const SubeData* sube, FuriString* parsed_data) {
        sube->current_balance.cents != sube->previous_balance.cents) {
         furi_string_cat_printf(
             parsed_data,
-            "Previous balance: %li.%02i pesos\n",
+            "Last balance: %li.%02i\n",
             sube->previous_balance.pesos,
             sube->previous_balance.cents);
     }
